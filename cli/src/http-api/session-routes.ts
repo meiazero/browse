@@ -1,9 +1,7 @@
 import http from "node:http"
 import { Effect } from "effect"
 import * as AuthProfile from "../auth/profile.ts"
-import { selectTarget } from "../execute.ts"
 import {
-  HttpRouteError,
   optionalSessionId,
   readJsonBody,
   requiredSessionId,
@@ -172,37 +170,12 @@ export function handleCliRequest(options: {
       const body = yield* readJsonBody(options.request)
       const request = yield* decodeRequest(SessionAdoptRequest, body, "session adopt")
       const requestedSessionId = optionalSessionId(request.sessionId)
-      const allTargets = options.registry.listRootTargets()
-      const available = yield* options.sessions.targetsForAdoption(requestedSessionId, allTargets)
-      const byTab = request.tabId === undefined ? undefined : allTargets.find((target) => target.tabId === request.tabId)
-      if (request.tabId !== undefined && !byTab)
-        throw new Error(`Tab ${request.tabId} is not available to agents. Ask the user to click the browse toolbar button on that tab.`)
-      if (byTab && !available.includes(byTab)) return yield* new HttpRouteError({ status: 400, code: "invalid-request", message: `Tab ${byTab.tabId} belongs to another browser. Start a new session for that browser.` })
-      const candidates = byTab ? [byTab] : request.targetSelection
-        ? available
-        : (() => {
-            const adoptableUserTargets = available.filter((target) =>
-              target.owner === "user" && (!target.opencodeBrowserSessionId || target.opencodeBrowserSessionId === requestedSessionId)
-            )
-            return adoptableUserTargets.length > 0 ? adoptableUserTargets : available
-          })()
-      const selectedTarget = selectTarget({
-        targets: candidates,
-        selection: request.targetSelection ?? {},
-        getUrl: (target) => target.targetInfo.url,
-        getIndex: (target) => allTargets.indexOf(target),
-      })
-      if (!selectedTarget) {
-        throw new Error("No page matched target selection")
-      }
-      const adoptedTargetId = selectedTarget.targetInfo.targetId
-      const { session, adoptedUrl } = yield* options.sessions.adopt({
+      const { session, adoptedUrl, adoptedTargetId } = yield* options.sessions.adoptSelected({
         ...(requestedSessionId ? { sessionId: requestedSessionId } : {}),
         createIfMissing: request.createIfMissing,
-        targetId: adoptedTargetId,
-        targetUrl: selectedTarget.targetInfo.url,
-        tabId: selectedTarget.tabId,
-      })
+        ...(request.tabId === undefined ? {} : { tabId: request.tabId }),
+        ...(request.targetSelection ? { targetSelection: request.targetSelection } : {}),
+      }, () => options.registry.listRootTargets())
       sendJson(options.response, { session, adoptedUrl, adoptedTargetId })
       return
     }

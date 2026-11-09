@@ -37,7 +37,7 @@ export function createHttpRequestHandler(options: {
   readonly relayInstance: { readonly id: string; readonly startedAt: string; readonly pid: number; readonly managed: boolean }
   readonly shutdown: RelayShutdown
   readonly extensionStatus: () => Pick<ExtensionStatus,
-    "connected" | "pairingState" | "nextStep" | "version" | "build" | "origin" | "protocolVersion" | "protocolCompatible" | "protocolLegacy" | "browsers" | "rejectedConnections" | "pairingFailures" | "cdpClients" | "processFaults"
+    "connected" | "pairingState" | "nextStep" | "version" | "build" | "origin" | "protocolVersion" | "protocolCompatible" | "protocolLegacy" | "browsers" | "rejectedConnections" | "pairingFailures" | "cdpClients" | "processFaults" | "transport"
   >
   readonly recordingRelay: RecordingRelay
   readonly flightRecorder: FlightRecorderRelay

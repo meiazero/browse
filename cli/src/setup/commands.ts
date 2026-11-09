@@ -20,7 +20,7 @@ import { syncDevExtension } from "./dev-extension.ts"
 import { cliCommand, compiledBinary, defaultSettingsPath, devExtensionFolder, entrySpawnCommand, installedBinaryPath, installerBinaryPath, installCommand, runningEntry } from "../paths.ts"
 import { runCommand } from "../update/auto-update.ts"
 import { unpackedExtensionId } from "../protocol.ts"
-import { parseHostname, readRelayConfig, writeRelayConfig } from "../relay/config.ts"
+import { parseBidiEndpoint, parseHostname, readRelayConfig, writeRelayConfig, type RelayConfig } from "../relay/config.ts"
 import { relayAuthorization } from "../relay/secrets.ts"
 import { defaultSiteSecretsDir } from "../auth/site-secrets.ts"
 import { opencodeBrowserBuildId } from "../version.ts"
@@ -279,19 +279,27 @@ async function revokePairing(target: string | undefined) {
   )
 }
 
-/** `set hostname <127.0.0.1|0.0.0.0>`: saves where the relay listens and restarts a running relay to apply it. */
+/** Relay connection settings take effect after restarting a running relay. */
 export async function set(args: string[]) {
   const [key, value] = args
   const hostname = parseHostname(value)
-  if (key !== "hostname" || hostname === undefined) {
+  const browser = value === "chromium" || value === "firefox" ? value : undefined
+  const bidiEndpoint = parseBidiEndpoint(value)
+  const update: RelayConfig | undefined = key === "hostname" && hostname ? { hostname }
+    : key === "browser" && browser ? { browser }
+    : key === "bidiEndpoint" && bidiEndpoint ? { bidiEndpoint }
+    : undefined
+  if (!update) {
     log(`Usage: ${cliCommand("set hostname <127.0.0.1|0.0.0.0>")}`)
+    log(`       ${cliCommand("set browser <chromium|firefox>")}`)
+    log(`       ${cliCommand("set bidiEndpoint <ws://host:port/session>")}`)
     log("  127.0.0.1  only browsers on this computer can connect (the default)")
     log("  0.0.0.0    browsers on other computers can connect too, after pairing")
     process.exitCode = 1
     return
   }
-  writeRelayConfig({ ...readRelayConfig(), hostname })
-  log(`✓ hostname is ${hostname}`)
+  writeRelayConfig({ ...readRelayConfig(), ...update })
+  log(`✓ ${key} is ${Object.values(update)[0]}`)
   const running = await fetch(`${relayBase()}/version`, { signal: AbortSignal.timeout(2000) }).then(
     (response) => response.ok,
     () => false,
@@ -300,9 +308,9 @@ export async function set(args: string[]) {
     const [file, ...prefix] = entrySpawnCommand(runningEntry())
     const restarted = spawnSync(file!, [...prefix, "relay", "restart"], { stdio: "inherit" })
     if (restarted.status !== 0)
-      log(`! The relay is still running with the old hostname. Run \`${cliCommand("relay restart --force")}\` to apply it.`)
+      log(`! The relay is still running with the old setting. Run \`${cliCommand("relay restart")}\` to apply it.`)
   }
-  if (hostname === "127.0.0.1") return
+  if (key !== "hostname" || hostname === "127.0.0.1") return
   const tailscale = Object.values(networkInterfaces())
     .flat()
     .find((address) => address?.family === "IPv4" && /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address.address))

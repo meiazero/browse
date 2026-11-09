@@ -1,5 +1,5 @@
 import { Deferred, Effect, Option, Semaphore } from "effect"
-import { ExecuteSandbox, type ExecuteTargetSelection } from "./execute.ts"
+import { ExecuteSandbox, selectTarget, type ExecuteTargetSelection } from "./execute.ts"
 import { ExecuteCpuScheduler } from "./execute-realm.ts"
 import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus, NetworkCaptureStopOptions } from "./network-capture.ts"
 import { generateSessionId } from "./relay/helpers.ts"
@@ -166,6 +166,7 @@ export class OpenCodeBrowserSessions {
   }
 
   private createAcceptedSession(id: string | undefined, options?: SessionCreateOptions): OpenCodeBrowserSession {
+    this.hooks.validateSessionOptions?.(options)
     const sessionId = id ?? generateSessionId(this.sessions)
     if (this.sessions.has(sessionId)) {
       throw sessionError("already-exists", `Session already exists: ${sessionId}`, sessionId)
@@ -208,6 +209,9 @@ export class OpenCodeBrowserSessions {
     const sessionId = id ?? generateSessionId(manager.sessions)
     return yield* manager.admission.withIdentityChange(sessionId, Effect.gen(function* () {
       const session = yield* trySession(() => manager.createAcceptedSession(sessionId, options))
+      if (manager.hooks.initializeSessionPage) {
+        yield* manager.hooks.initializeSessionPage(sessionId).pipe(Effect.onError(() => manager.cleanupCreatedSession(session)))
+      }
       yield* manager.admission.flushPersistenceWithRollback(() => Effect.gen(function* () {
         if (manager.sessions.get(session.id) === session) manager.sessions.delete(session.id)
         yield* manager.closeOpenCodeBrowserSession(session)
@@ -241,6 +245,7 @@ export class OpenCodeBrowserSessions {
     return Effect.gen(function* () {
       const session = manager.sessions.get(id)
       if (!session) return yield* sessionError("not-found", `Session not found: ${id}`, id)
+      yield* trySession(() => manager.hooks.validateSessionOptions?.({ allowedOrigins: patterns }))
       if (patterns.length > 0) session.allowedOrigins = patterns
       else delete session.allowedOrigins
       session.updatedAt = new Date().toISOString()
@@ -519,6 +524,50 @@ export class OpenCodeBrowserSessions {
       const browser = this.resolveBrowser(undefined, session)
       return targets.filter((target) => !browser?.key || this.hooks.targetBrowserKey?.(target.tabId) === browser.key)
     })
+  }
+
+  isAdoptedContext(sessionId: string, context: string): boolean {
+    const target = this.sessions.get(sessionId)?.target
+    return target?.owner === "user" && target.id === context
+  }
+
+  adoptSelected(options: {
+    readonly sessionId?: string
+    readonly createIfMissing: boolean
+    readonly tabId?: number
+    readonly targetSelection?: ExecuteTargetSelection
+  }, getTargets = () => this.hooks.getTargets?.() ?? []): Effect.Effect<AdoptionResult & { readonly adoptedTargetId: string }, Error> {
+    const manager = this
+    return this.admission.withAdmission(options.sessionId, Effect.gen(function* () {
+      const prepared = manager.hooks.prepareAdoptionTargets
+        ? yield* manager.resolveWorkSession(options.sessionId, options.createIfMissing)
+        : undefined
+      const sessionId = prepared?.session.id ?? options.sessionId
+      return yield* Effect.gen(function* () {
+        if (prepared) yield* manager.hooks.prepareAdoptionTargets!(prepared.session.id)
+        const allTargets = getTargets()
+        const available = yield* manager.targetsForAdoption(sessionId, allTargets)
+        const byTab = options.tabId === undefined ? undefined : allTargets.find((target) => target.tabId === options.tabId)
+        if (options.tabId !== undefined && !byTab) throw new Error(`Tab ${options.tabId} is not available to agents. Ask the user to click the browse toolbar button on that tab.`)
+        if (byTab && !available.includes(byTab)) return yield* sessionError("invalid-request", `Tab ${byTab.tabId} belongs to another browser. Start a new session for that browser.`)
+        const userTargets = available.filter((target) => target.owner === "user" && (!target.opencodeBrowserSessionId || target.opencodeBrowserSessionId === sessionId))
+        const selected = selectTarget({
+          targets: byTab ? [byTab] : options.targetSelection ? available : userTargets.length ? userTargets : available,
+          selection: options.targetSelection ?? {},
+          getUrl: (target) => target.targetInfo.url,
+          getIndex: (target) => allTargets.indexOf(target),
+        })
+        if (!selected) throw new Error("No page matched target selection")
+        const result = yield* manager.adopt({
+          ...(sessionId ? { sessionId } : {}),
+          createIfMissing: options.createIfMissing,
+          targetId: selected.targetInfo.targetId,
+          targetUrl: selected.targetInfo.url,
+          tabId: selected.tabId,
+        })
+        return { ...result, session: { ...result.session, ...(prepared?.created ? { created: true } : {}) }, adoptedTargetId: selected.targetInfo.targetId }
+      }).pipe(Effect.onError(() => prepared?.created ? manager.cleanupCreatedSession(prepared.session) : Effect.void))
+    }))
   }
 
   adopt(options: {

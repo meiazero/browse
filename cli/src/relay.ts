@@ -19,7 +19,8 @@ import { devExtension, PUBLIC_STORE_ID, stateRoot, storeConfig } from "./paths.t
 import { ProtectedFrameTracker } from "./cdp/protected-frames.ts"
 import type { CdpEvent, JsonObject } from "./protocol.ts"
 import { RecordingRelay } from "./recording-relay.ts"
-import { relayHostname } from "./relay/config.ts"
+import { defaultBidiEndpoint, readRelayConfig, relayHostname } from "./relay/config.ts"
+import { createBidiGuard } from "./relay/bidi-guard.ts"
 import {
   closeHttpServer,
   closeWebSocketServer,
@@ -81,6 +82,8 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   readonly additionalExtensionOrigins?: readonly string[]
 } = {}) {
   const listenHost = relayHostname()
+  const relayConfig = readRelayConfig()
+  const bidi = relayConfig.browser === "firefox"
   const host = "127.0.0.1"
   const port = options.port ?? defaultPort
   const releaseTargetGraceMs = Math.max(0, options.releaseTargetGraceMs ?? 10_000)
@@ -247,13 +250,36 @@ const makeRelay = Effect.fnUntraced(function* (options: {
   const keepaliveIntervalMs = yield* Config.Int("OPENCODE_BROWSER_KEEPALIVE_MS").pipe(Config.withDefault(20_000))
   const idleTabTtlMs = yield* Config.Int("OPENCODE_BROWSER_IDLE_TAB_TTL_MS").pipe(Config.withDefault(15 * 60_000))
   const journalBaseDir = defaultJournalBaseDir()
+  const bidiSandboxes = new Map<string, ExecuteSandbox>()
+  let nextBidiTab = 0
+
+  const syncBidiTargets = (sessionId: string, targets: readonly { id: string; url: string; owned: boolean }[]) => {
+    const live = new Set(targets.map((target) => target.id))
+    for (const target of registry.listRootTargets()) {
+      if (live.has(target.targetInfo.targetId)) continue
+      registry.detachRootTargetState(target.tabId)
+      sessions.markTargetDetached(target.targetInfo.targetId)
+    }
+    for (const target of targets) {
+      const previous = registry.targetsByTargetId.get(target.id)
+      const tabId = previous?.tabId ?? ++nextBidiTab
+      registry.addRootTarget({
+        tabId,
+        sessionId: target.id,
+        targetInfo: { targetId: target.id, type: "page", title: "", url: target.url, attached: true, canAccessOpener: false, browserContextId: "default" },
+        owner: target.owned ? "relay" : "user",
+        ...(previous?.opencodeBrowserSessionId ? { opencodeBrowserSessionId: previous.opencodeBrowserSessionId } : target.owned ? { opencodeBrowserSessionId: sessionId } : {}),
+      })
+    }
+  }
 
   // The sandbox wiring stays here: it closes over `sessions` itself and over `navigationGuard`, declared below.
   const sessions: OpenCodeBrowserSessions = new OpenCodeBrowserSessions(
     endpointUrl,
-    (id, onDefaultTargetChange) =>
-      new ExecuteSandbox({
+    (id, onDefaultTargetChange) => {
+      const sandbox = new ExecuteSandbox({
         endpointUrl,
+        ...(bidi ? { protocol: "bidi", readOnly: () => sessions.isReadOnly(id), onBidiTargets: (targets) => syncBidiTargets(id, targets) } as const : {}),
         authToken,
         sessionId: id,
         onDefaultTargetChange,
@@ -264,7 +290,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
           const target = registry.targetsByTargetId.get(targetId)
           return target !== undefined && isTabRecorded(target.tabId)
         },
-        requestHandoff: ({ message, timeoutMs, target, start, cancelStart }) => presentation.requestHandoff({
+        requestHandoff: ({ message, timeoutMs, target, start, cancelStart }) => bidi ? Promise.reject(new Error("Firefox/Zen handoff requires the Firefox extension, which is not available yet")) : presentation.requestHandoff({
           sessionId: id,
           message,
           timeoutMs,
@@ -272,23 +298,28 @@ const makeRelay = Effect.fnUntraced(function* (options: {
           ...(start ? { start } : {}),
           ...(cancelStart ? { cancelStart } : {}),
         }),
-      }),
+      })
+      if (bidi) bidiSandboxes.set(id, sandbox)
+      return sandbox
+    },
     {
       resolveBrowser: (requested, session) => {
+        if (bidi) return requested && requested !== "firefox" ? { error: "This relay is configured for Firefox/Zen; select browser 'firefox'" } : { id: "firefox", key: "bidi" }
         const link = handshake.resolveSessionBrowser(requested, session)
         return "error" in link ? link : { id: link.id, key: link.key }
       },
       checkBrowserResponsive: (key) => {
+        if (bidi) return Effect.void
         const link = browsers.byKey(key)
         return link ? link.rpc.send({ method: "ping" }).pipe(Effect.asVoid)
           : Effect.fail(new Error("The browser disconnected before execution."))
       },
-      targetBrowserKey: (tabId) => browsers.ownerKey(tabId),
+      targetBrowserKey: (tabId) => bidi ? "bidi" : browsers.ownerKey(tabId),
       getUserAttachedPageUrls: (session) => registry.listRootTargets()
-        .filter((target) => target.owner === "user" && browsers.ownerKey(target.tabId) === session.browser?.key)
+        .filter((target) => target.owner === "user" && (bidi || browsers.ownerKey(target.tabId) === session.browser?.key))
         .map((target) => target.targetInfo.url || "about:blank"),
       executeTimeoutMs,
-      onExecuteStateChange: (sessionId, executing) => presentation.onSessionExecuteStateChange(sessionId, executing),
+      onExecuteStateChange: (sessionId, executing) => bidi ? undefined : presentation.onSessionExecuteStateChange(sessionId, executing),
       onExecuteRecord: (record) => {
         const entry = makeJournalEntry({
           sessionId: record.sessionId,
@@ -306,9 +337,30 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         })
         return appendJournalEntry({ baseDir: journalBaseDir, entry })
       },
-      onTargetOwnershipChange: (change) => reconcileTargetOwnership(change),
-      onReleaseRelayTarget: (targetId) => releaseRelayTarget(targetId),
+      onTargetOwnershipChange: (change) => { if (!bidi) reconcileTargetOwnership(change) },
+      onReleaseRelayTarget: (targetId) => bidi ? Effect.tryPromise({
+        try: async () => {
+          const target = registry.targetsByTargetId.get(targetId)
+          if (target?.owner !== "relay" || !target.opencodeBrowserSessionId) return
+          await bidiSandboxes.get(target.opencodeBrowserSessionId)?.closeBidiTarget(targetId)
+          registry.detachRootTargetState(target.tabId)
+        },
+        catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+      }) : releaseRelayTarget(targetId),
       getTargets: () => registry.listRootTargets(),
+      ...(bidi ? {
+        validateSessionOptions: (options) => {
+          if (options?.readOnly || options?.allowedOrigins?.length) throw new Error("Read-only sessions and domain allowlists require Chromium; Firefox/Zen policy enforcement is not available yet")
+        },
+        prepareAdoptionTargets: (id: string) => Effect.tryPromise({
+          try: () => bidiSandboxes.get(id)!.refreshBidiTargets(),
+          catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+        }),
+        initializeSessionPage: (id: string) => Effect.tryPromise({
+          try: () => bidiSandboxes.get(id)!.initializePage(),
+          catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
+        }),
+      } : {}),
       relayTargetIdsForSession: (sessionId) => [
         ...registry.listRootTargets()
           .filter((target) => target.owner === "relay" && target.opencodeBrowserSessionId === sessionId)
@@ -319,11 +371,19 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       ],
       onCancelSessionHandoff: (sessionId) => handoffs.cancelForSession(sessionId) !== undefined,
       onSessionsChanged: async (entries) => {
-        if (catalogWritesEnabled) await sessionCatalog?.save(entries)
+        // BiDi ids expire with the browser session; never restore an unrelated tab under an old id.
+        if (catalogWritesEnabled) await sessionCatalog?.save(bidi ? entries.map(({ target: _target, ...entry }) => entry) : entries)
+        if (bidi) for (const id of bidiSandboxes.keys()) if (!sessions.sessions.has(id)) bidiSandboxes.delete(id)
       },
     },
     registry,
   )
+
+  // ponytail: one attached Firefox session at a time; multiplexing requires a shared BiDi session broker.
+  const bidiGuard = bidi ? createBidiGuard({
+    endpoint: relayConfig.bidiEndpoint ?? defaultBidiEndpoint,
+    isAdoptedContext: (sessionId, context) => sessions.isAdoptedContext(sessionId, context),
+  }) : undefined
 
   const cdpRouter = new CdpRouter(cdpClients, registry, (id, tabId) => {
     const session = sessions.sessions.get(id)
@@ -691,7 +751,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     revokeBrowser: (key) => handshake.revokeBrowser(key),
     cleanupTabs,
     settings: settingsSync.httpSettings,
-    extensionStatus: () => handshake.extensionStatus(),
+    extensionStatus: () => ({ ...handshake.extensionStatus(), ...(bidi ? { transport: "bidi" as const } : {}) }),
   })
 
   let relayReady = false
@@ -714,6 +774,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     recordingRelay,
     handleExtensionMessage,
     handleCdpMessage,
+    bidiGuard,
     debugLog,
   })
 
@@ -727,6 +788,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         waitedMs: defaultShutdownTimeoutMs,
       }),
     })
+    if (bidiGuard) yield* Effect.tryPromise(() => bidiGuard.close()).pipe(logCloseError("Failed to end BiDi session"))
     yield* rootLifecycle.close()
     if (managed) {
       yield* audit(RelayLifecycleEvent.cases.Closed.make({ instanceId: browserId })).pipe(
@@ -769,7 +831,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         catch: (cause) => cause instanceof Error ? cause : new Error("Load browse session catalog", { cause }),
       })
       yield* Effect.try({
-        try: () => sessions.restore(restoredSessions),
+        try: () => sessions.restore(bidi ? restoredSessions.map(({ target: _target, ...entry }) => entry) : restoredSessions),
         catch: (cause) => cause instanceof Error ? cause : new Error("Restore browse sessions", { cause }),
       })
       catalogWritesEnabled = true

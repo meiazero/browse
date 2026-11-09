@@ -17,6 +17,7 @@ import {
   type SandboxGlobals,
 } from "./execute/code-runner.ts"
 import { DefaultPageHost } from "./execute/default-page.ts"
+import { bidiPageIdentity } from "./execute/bidi.ts"
 import { downloadCapabilityErrorMessage, installDownloadCapabilityGuard, installDownloadCapabilityGuards, installViewportZoomGuard } from "./execute/guards.ts"
 import {
   createExecuteLogCapture,
@@ -86,7 +87,7 @@ import {
   type ExecuteLogSummary,
   type ExecuteMedia,
 } from "./relay/schema.ts"
-import { relayToken } from "./relay/secrets.ts"
+import { relayToken, relayTokenQueryParam } from "./relay/secrets.ts"
 import type { SessionTarget } from "./relay/types.ts"
 import { executionContextFailureDiagnostic } from "./update/runtime-diagnostics.ts"
 import {
@@ -143,12 +144,15 @@ export {
   type RequestHandoff,
 }
 
-const { chromium, errors, internals } = await import("./execute/coreBundle.ts")
+const { chromium, firefox, errors, internals } = await import("./execute/coreBundle.ts")
 tunePatchright(internals)
 
 type ExecuteSandboxOptions = {
   readonly endpointUrl: string
-  /** The relay token for connectOverCDP; read from the data root when omitted. */
+  readonly protocol?: "cdp" | "bidi"
+  readonly onBidiTargets?: (targets: readonly { id: string; url: string; owned: boolean }[]) => void
+  readonly readOnly?: () => boolean
+  /** Read from the data root when omitted. */
   readonly authToken?: string
   readonly sessionId?: string
   readonly requestHandoff?: RequestHandoff
@@ -309,6 +313,7 @@ export class ExecuteSandbox extends DefaultPageHost {
           return result
         },
       }),
+      Effect.ensuring(Effect.sync(() => this.syncBidiTargets())),
     )
   }
 
@@ -491,6 +496,9 @@ export class ExecuteSandbox extends DefaultPageHost {
   }
 
   private async connectContext(): Promise<{ readonly browser: Browser; readonly context: BrowserContext }> {
+    if (this.options.protocol === "bidi" && (this.options.readOnly?.() || this.options.allowedOrigins?.()?.length)) {
+      throw new Error("Read-only sessions and domain allowlists require Chromium; Firefox/Zen policy enforcement is not available yet")
+    }
     if (!this.browser?.isConnected()) {
       const hadBrowser = this.browser !== undefined
       const staleBrowser = this.browser
@@ -502,16 +510,28 @@ export class ExecuteSandbox extends DefaultPageHost {
         }).pipe(Effect.ignore))
       }
       const adoptedDefaultTarget = this.defaultPageTargetId !== undefined && !this.ownsPage
+      const authToken = this.options.authToken ?? relayToken()
       try {
         // Let Playwright own timeout/transport cleanup; never race and abandon
         // a connect promise that could bind a page after reporting failure.
-        this.browser = await chromium.connectOverCDP(this.options.endpointUrl, {
-          timeout: adoptedDefaultTarget ? adoptedPageConnectTimeoutMs : playwrightConnectTimeoutMs,
-          headers: {
-            Authorization: `Bearer ${this.options.authToken ?? relayToken()}`,
-            ...(this.options.sessionId ? { "OpenCode-Browser-Session-Id": encodeURIComponent(this.options.sessionId), "OpenCode-Browser-Client-Kind": "sandbox" } : {}),
-          },
-        })
+        const timeout = adoptedDefaultTarget ? adoptedPageConnectTimeoutMs : playwrightConnectTimeoutMs
+        if (this.options.protocol === "bidi") {
+          const endpoint = new URL("/bidi", this.options.endpointUrl)
+          endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:"
+          endpoint.searchParams.set(relayTokenQueryParam, authToken)
+          if (!this.options.sessionId) throw new Error("Firefox/Zen requires a relay session identity")
+          endpoint.searchParams.set("opencodeBrowserSessionId", this.options.sessionId)
+          this.browser = await firefox.connectOverBiDi(endpoint.href, { timeout })
+          this.browser.once("disconnected", () => this.options.onBidiTargets?.([]))
+        } else {
+          this.browser = await chromium.connectOverCDP(this.options.endpointUrl, {
+            timeout,
+            headers: {
+              Authorization: `Bearer ${authToken}`,
+              ...(this.options.sessionId ? { "OpenCode-Browser-Session-Id": encodeURIComponent(this.options.sessionId), "OpenCode-Browser-Client-Kind": "sandbox" } : {}),
+            },
+          })
+        }
       } catch (cause) {
         if (adoptedDefaultTarget && cause instanceof errors.TimeoutError) {
           throw new SessionPageRecoveryError({
@@ -520,6 +540,7 @@ export class ExecuteSandbox extends DefaultPageHost {
             cause,
           })
         }
+        if (this.options.protocol === "bidi" && cause instanceof Error) throw new Error(cause.message.replaceAll(authToken, "[redacted]"))
         throw cause
       }
       this.unbindDefaultPage(this.defaultPageTargetId, {
@@ -536,7 +557,29 @@ export class ExecuteSandbox extends DefaultPageHost {
     const context = browser.contexts()[0] ?? (await browser.newContext())
     await registerAriaSnapshotSelector(context)
     installDownloadCapabilityGuards(context)
+    this.syncBidiTargets(context)
     return { browser, context }
+  }
+
+  private syncBidiTargets(context = this.browser?.contexts()[0]): void {
+    if (this.options.protocol !== "bidi" || !context || !this.browser?.isConnected()) return
+    this.options.onBidiTargets?.(context.pages().filter((page) => !page.isClosed()).map((page) => {
+      const identity = bidiPageIdentity(page)!
+      return { ...identity, url: page.url() }
+    }))
+  }
+
+  async refreshBidiTargets(): Promise<void> {
+    await this.connectContext()
+  }
+
+  async initializePage(): Promise<void> {
+    await this.acquireSessionPage()
+  }
+
+  async closeBidiTarget(targetId: string): Promise<void> {
+    const page = this.browser?.contexts().flatMap((context) => context.pages()).find((page) => !page.isClosed() && bidiPageIdentity(page)?.id === targetId)
+    if (page && bidiPageIdentity(page)?.owned) await page.close()
   }
 
   /**
@@ -589,6 +632,7 @@ export class ExecuteSandbox extends DefaultPageHost {
       addWarningOnce: (warning) => this.addWarningOnce(warning),
     })
     this.networkCapture.bindPage(this.page)
+    this.syncBidiTargets(context)
     return { browser, context, page }
   }
 

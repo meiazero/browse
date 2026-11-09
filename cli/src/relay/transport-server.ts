@@ -19,6 +19,7 @@ import type { RelayShutdown } from "./shutdown.ts"
 import type { OpenCodeBrowserSessions } from "../session-manager.ts"
 import type { ExtensionHandshake } from "./extension-handshake.ts"
 import { sendUpgradeError } from "./process-guard.ts"
+import type { createBidiGuard } from "./bidi-guard.ts"
 
 export interface TransportServerDeps {
   readonly host: string
@@ -38,6 +39,7 @@ export interface TransportServerDeps {
   readonly handleExtensionMessage: (link: BrowserLink, raw: string) => void
   readonly handleCdpMessage: (socket: WebSocket, raw: string) => Effect.Effect<void, Error>
   readonly debugLog: ((line: string) => void) | undefined
+  readonly bidiGuard?: ReturnType<typeof createBidiGuard> | undefined
 }
 
 export function createRelayTransportServers(deps: TransportServerDeps): {
@@ -130,6 +132,10 @@ export function createRelayTransportServers(deps: TransportServerDeps): {
     }
     const origin = Array.isArray(request.headers.origin) ? request.headers.origin[0] : request.headers.origin
     if (requestUrl.pathname === "/extension") {
+      if (deps.bidiGuard) {
+        sendUpgradeError({ socket, status: 403, message: "This relay uses Firefox/Zen BiDi; Chromium extensions require browser=chromium" })
+        return
+      }
       const originError = validateWebSocketOrigin({
         origin,
         requireChromeExtension: true,
@@ -148,9 +154,21 @@ export function createRelayTransportServers(deps: TransportServerDeps): {
       sendUpgradeError({ socket, status: 401, message: "Missing or invalid browse relay token" })
       return
     }
-    if (requestUrl.pathname.startsWith("/devtools/browser/")) {
+    if (requestUrl.pathname.startsWith("/devtools/browser/") || (requestUrl.pathname === "/bidi" && deps.bidiGuard)) {
+      if (deps.bidiGuard && requestUrl.pathname.startsWith("/devtools/browser/")) {
+        sendUpgradeError({ socket, status: 403, message: "CDP is unavailable on Firefox/Zen; use browse execute over BiDi" })
+        return
+      }
       const sessionId = requestUrl.searchParams.get("opencodeBrowserSessionId") ?? headerValue(request.headers["opencode-browser-session-id"])
-      if (!shutdownControl.accepting && (headerValue(request.headers["opencode-browser-client-kind"]) !== "sandbox" || !sessionId || !sessions.hasPendingWork(sessionId))) {
+      if (requestUrl.pathname === "/bidi" && (!sessionId || !sessions.sessions.has(sessionId))) {
+        sendUpgradeError({ socket, status: 403, message: "BiDi requires an active browse session" })
+        return
+      }
+      if (requestUrl.pathname === "/bidi" && deps.bidiGuard?.busy) {
+        sendUpgradeError({ socket, status: 503, message: "Firefox/Zen already has an attached client; delete or reset its browse session before connecting another" })
+        return
+      }
+      if (!shutdownControl.accepting && ((requestUrl.pathname !== "/bidi" && headerValue(request.headers["opencode-browser-client-kind"]) !== "sandbox") || !sessionId || !sessions.hasPendingWork(sessionId))) {
         sendUpgradeError({ socket, status: 503, message: "Relay is draining for an explicit restart" })
         return
       }
@@ -177,6 +195,10 @@ export function createRelayTransportServers(deps: TransportServerDeps): {
       return
     }
     const opencodeBrowserSessionId = requestUrl.searchParams.get("opencodeBrowserSessionId") ?? headerValue(request.headers["opencode-browser-session-id"])
+    if (requestUrl.pathname === "/bidi" && deps.bidiGuard) {
+      deps.bidiGuard.accept(socket, opencodeBrowserSessionId)
+      return
+    }
     cdpClients.register(socket, opencodeBrowserSessionId, headerValue(request.headers["opencode-browser-client-kind"]) === "sandbox" ? "sandbox" : "raw")
     debugLog?.(`client+ ${opencodeBrowserSessionId ?? "raw"} total=${cdpClients.size}`)
     socket.on("message", (data) => {

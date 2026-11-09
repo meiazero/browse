@@ -50,6 +50,7 @@ export type PendingSessionWork = {
 }
 
 export type SessionHooks = {
+  readonly validateSessionOptions?: (options: SessionCreateOptions | undefined) => void
   readonly checkBrowserResponsive?: (key: string) => Effect.Effect<void, Error>
   /** Select once on creation, otherwise check the stored profile and any requested selector. */
   readonly resolveBrowser?: (requested?: string, session?: OpenCodeBrowserSession) => { readonly id: string; readonly key: string } | { readonly error: string; readonly unavailable?: true }
@@ -74,6 +75,8 @@ export type SessionHooks = {
   readonly relayTargetIdsForSession?: (sessionId: string) => readonly string[]
   /** Live root targets currently attached to the relay. */
   readonly getTargets?: () => readonly ConnectedTarget[]
+  readonly prepareAdoptionTargets?: (sessionId: string) => Effect.Effect<void, Error>
+  readonly initializeSessionPage?: (sessionId: string) => Effect.Effect<void, Error>
   /** Persist session identity and target continuity after durable lifecycle changes. */
   readonly onSessionsChanged?: (sessions: readonly PersistedSession[]) => unknown | Promise<unknown>
   /** Cancel the session's pending handoff so its waiter fails; true when one was pending. */

@@ -25,6 +25,7 @@ export function createBidiGuard(options: {
   let active: { close: () => Promise<void> } | undefined
 
   return {
+    get busy(): boolean { return active !== undefined },
     // The caller authenticates the socket and supplies its session identity; wire messages cannot grant ownership.
     accept(client: WebSocket, sessionId?: string): void {
       if (stopped || active) {

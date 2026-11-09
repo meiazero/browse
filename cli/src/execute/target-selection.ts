@@ -1,5 +1,6 @@
 import { Effect, Schema } from "effect"
 import type { Page } from "patchright-core"
+import { bidiPageIdentity } from "./bidi.ts"
 import { playwrightCloseTimeoutMs, runPlaywrightOperation } from "./page-recovery.ts"
 
 export type ExecuteTargetSelection = {
@@ -104,6 +105,8 @@ export async function pageTargetId(page: Page): Promise<string> {
   if (page.isClosed()) {
     throw new Error("Cannot identify the CDP target for a closed page")
   }
+  const bidi = bidiPageIdentity(page)
+  if (bidi) return bidi.id
   const session = await page.context().newCDPSession(page)
   try {
     const result = await session.send("Target.getTargetInfo")

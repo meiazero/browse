@@ -295,6 +295,7 @@ export const ConnectedBrowser = Schema.Struct({
 export interface ConnectedBrowser extends Schema.Schema.Type<typeof ConnectedBrowser> {}
 
 export const ExtensionStatus = Schema.Struct({
+  transport: Schema.optionalKey(Schema.Literals(["cdp", "bidi"])),
   connected: Schema.Boolean,
   pairingState: Schema.optionalKey(Schema.Literals(["connected", "incompatible", "refused", "unpaired", "paired-offline", "not-seen"])),
   nextStep: Schema.optionalKey(Schema.String),

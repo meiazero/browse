@@ -101,6 +101,8 @@ if (command === "--version" || command === "-v") {
     --revoke <browser>           Unpair a browser (its id, name or profile) and disconnect it;
                                  \`--revoke legacy\` retires the shared code of earlier versions
   set hostname <address>         Where the relay listens: 127.0.0.1 (this computer, the default) or 0.0.0.0
+  set browser <chromium|firefox>  Browser transport (default: chromium)
+  set bidiEndpoint <ws://...>    Firefox/Zen endpoint (default: ws://127.0.0.1:9222/session)
                                  (browsers on other computers can connect too, after pairing)
   update [--check]               Update now: rerun whatever installed browse (the install script for a binary
                                  install, npm install -g for an npm one); --check only says whether there's an

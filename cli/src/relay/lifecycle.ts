@@ -275,6 +275,7 @@ export const ensureExtensionConnected = Effect.fn("RelayLifecycle.ensureExtensio
     ExtensionStatus,
     ExtensionProtocolIncompatible | ExtensionDisconnected
   > => {
+    if (status.transport === "bidi") return Effect.succeed(status)
     // On a reconnect, another online profile can't satisfy a bound session's wait.
     const bound = options.sessionId ? status.sessions?.find((session) => session.id === options.sessionId && session.browser) : undefined
     if (bound) {

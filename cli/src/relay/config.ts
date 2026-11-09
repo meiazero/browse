@@ -10,7 +10,18 @@ import { configRoot } from "../paths.ts"
 
 export const hostnames = ["127.0.0.1", "0.0.0.0"] as const
 export type Hostname = (typeof hostnames)[number]
-export type RelayConfig = { hostname?: Hostname }
+export type RelayConfig = { hostname?: Hostname; browser?: "chromium" | "firefox"; bidiEndpoint?: string }
+export const defaultBidiEndpoint = "ws://127.0.0.1:9222/session"
+
+export function parseBidiEndpoint(input: unknown): string | undefined {
+  if (typeof input !== "string") return undefined
+  try {
+    const url = new URL(input)
+    return (url.protocol === "ws:" || url.protocol === "wss:") && !url.username && !url.password ? url.href : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export const relayConfigPath = (root = configRoot()) => path.join(root, "config.json")
 
@@ -23,13 +34,18 @@ export function parseHostname(input: unknown): Hostname | undefined {
 }
 
 export function readRelayConfig(root = configRoot()): RelayConfig {
+  let value: Record<string, unknown> | null
   try {
-    const value = JSON.parse(fs.readFileSync(relayConfigPath(root), "utf8")) as { hostname?: unknown } | null
-    const hostname = parseHostname(value?.hostname)
-    return hostname === undefined ? {} : { hostname }
+    value = JSON.parse(fs.readFileSync(relayConfigPath(root), "utf8")) as Record<string, unknown> | null
   } catch {
     return {}
   }
+  const hostname = parseHostname(value?.hostname)
+  const browser = value?.browser === "firefox" || value?.browser === "chromium" ? value.browser : undefined
+  const bidiEndpoint = parseBidiEndpoint(value?.bidiEndpoint)
+  if (value?.browser !== undefined && !browser) throw new Error("Relay browser must be chromium or firefox")
+  if (value?.bidiEndpoint !== undefined && !bidiEndpoint) throw new Error("Relay bidiEndpoint must be a ws:// or wss:// URL without credentials")
+  return { ...(hostname ? { hostname } : {}), ...(browser ? { browser } : {}), ...(bidiEndpoint ? { bidiEndpoint } : {}) }
 }
 
 export function writeRelayConfig(config: RelayConfig, root = configRoot()) {
