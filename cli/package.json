@@ -52,5 +52,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "patchedDependencies": {
+    "patchright-core@1.63.0": "patches/patchright-core@1.63.0.patch"
   }
 }

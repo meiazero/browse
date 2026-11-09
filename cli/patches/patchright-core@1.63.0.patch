@@ -1,0 +1,381 @@
+diff --git a/lib/coreBundle.js b/lib/coreBundle.js
+index a8815ac09d0e0ad9d0b291e9ed6ae98b9bba2130..05728fe1f943d79809524fd98e8595ddf43a59ba 100644
+--- a/lib/coreBundle.js
++++ b/lib/coreBundle.js
+@@ -4113,6 +4113,7 @@ var init_protocolMetainfo = __esm({
+       ["BrowserType.launch", { title: "Launch browser" }],
+       ["BrowserType.launchPersistentContext", { title: "Launch persistent context" }],
+       ["BrowserType.connectOverCDP", { title: "Connect over CDP" }],
++      ["BrowserType.connectOverBiDi", { title: "Connect over BiDi" }],
+       ["BrowserType.connectToWorker", { title: "Connect to worker" }],
+       ["Disposable.dispose", { internal: true }],
+       ["Electron.launch", { title: "Launch electron" }],
+@@ -18317,6 +18318,12 @@ var init_frames = __esm({
+       }
+       async _context(world) {
+         if (this._isDetached()) throw new Error("Frame was detached");
++        if (this._page.browserContext._browser.options.isBiDiAttach) {
++          const context = await this._contextData.get(world).contextPromise;
++          if (context instanceof FrameExecutionContext)
++            return context;
++          throw new Error(context.destroyedReason);
++        }
+         let client;
+         try {
+           client = this._page.delegate._sessionForFrame(this)._client;
+@@ -18398,6 +18405,8 @@ var init_frames = __esm({
+       }
+       existingContext(world) {
+         if (this._isDetached()) return null;
++        if (this._page.browserContext._browser.options.isBiDiAttach)
++          return this._contextData.get(world).context;
+         return (world === "main" ? this._iframeWorld || this._mainWorld : this._isolatedWorld) || null;
+       }
+       utilityContext() {
+@@ -22358,6 +22367,7 @@ var init_page = __esm({
+         return await this.screenshotter.screenshotPage(progress2, options);
+       }
+       async close(progress2, options = {}) {
++        this.delegate.assertCanClose?.();
+         await progress2.race(this._close(options));
+       }
+       async _close(options = {}) {
+@@ -22375,6 +22385,7 @@ var init_page = __esm({
+         this._customCloseHandler = handler;
+       }
+       async runBeforeUnload(progress2) {
++        this.delegate.assertCanClose?.();
+         await progress2.race(this._runBeforeUnload());
+       }
+       async _runBeforeUnload() {
+@@ -24149,6 +24160,13 @@ var init_validator = __esm({
+       browser: tChannel(["Browser"]),
+       defaultContext: tOptional(tChannel(["BrowserContext"]))
+     });
++    scheme.BrowserTypeConnectOverBiDiParams = tObject({
++      wsEndpoint: tString
++    });
++    scheme.BrowserTypeConnectOverBiDiResult = tObject({
++      browser: tChannel(["Browser"]),
++      defaultContext: tChannel(["BrowserContext"])
++    });
+     scheme.BrowserTypeConnectToWorkerParams = tObject({
+       endpoint: tString
+     });
+@@ -42141,6 +42159,9 @@ ${updatedLog}`);
+       async connectOverCDP(progress2, params2) {
+         throw new Error("CDP connections are only supported by Chromium");
+       }
++      async connectOverBiDi(progress2, params2) {
++        throw new Error("BiDi connections are only supported by Firefox");
++      }
+       async connectToWorker(progress2, endpoint) {
+         throw new Error("CDP connections are only supported by Chromium");
+       }
+@@ -42211,7 +42232,9 @@ var init_bidiConnection = __esm({
+     kBrowserCloseMessageId2 = Number.MAX_SAFE_INTEGER - 1;
+     kShutdownSessionNewMessageId = kBrowserCloseMessageId2 - 1;
+     BidiConnection = class {
+-      constructor(transport, onDisconnect, protocolLogger, browserLogsCollector) {
++      constructor(transport, onDisconnect, protocolLogger, browserLogsCollector, isBiDiAttach = false) {
++        this._isBiDiAttach = isBiDiAttach;
++        this._ownedBrowsingContexts = /* @__PURE__ */ new Set();
+         this._lastId = 0;
+         this._closed = false;
+         this._browsingContextToSession = /* @__PURE__ */ new Map();
+@@ -42232,6 +42255,12 @@ var init_bidiConnection = __esm({
+         return ++this._lastId;
+       }
+       rawSend(message) {
++        if (this._isBiDiAttach) {
++          if (message.method === "browser.close")
++            throw new Error("Cannot shut down an attached browser");
++          if (message.method === "browsingContext.close" && !this._ownedBrowsingContexts.has(message.params.context))
++            throw new Error("Cannot close a tab that this connection did not create");
++        }
+         this._protocolLogger("send", message);
+         this._transport.send(message);
+       }
+@@ -44239,6 +44268,11 @@ ${params2.stackTrace?.callFrames.map((f) => {
+         }
+         await Promise.all(ids.map((script) => this._session.send("script.removePreloadScript", { script })));
+       }
++      assertCanClose() {
++        const browser = this._browserContext._browser;
++        if (browser.options.isBiDiAttach && !browser._connection._ownedBrowsingContexts.has(this._session.sessionId))
++          throw new Error("Cannot close a tab that this connection did not create");
++      }
+       async closePage(runBeforeUnload) {
+         if (runBeforeUnload) {
+           this._session.sendMayFail("browsingContext.close", {
+@@ -44639,18 +44673,29 @@ var init_bidiBrowser = __esm({
+         this._contexts = /* @__PURE__ */ new Map();
+         this._bidiPages = /* @__PURE__ */ new Map();
+         this._cacheBehavior = "default";
+-        this._connection = new BidiConnection(transport, this._onDisconnect.bind(this), options.protocolLogger, options.browserLogsCollector);
++        this._connection = new BidiConnection(transport, this._onDisconnect.bind(this), options.protocolLogger, options.browserLogsCollector, options.isBiDiAttach);
+         this._browserSession = this._connection.browserSession;
+         this._eventListeners = [
+           eventsHelper.addEventListener(this._browserSession, "browsingContext.contextCreated", this._onBrowsingContextCreated.bind(this)),
+           eventsHelper.addEventListener(this._browserSession, "script.realmDestroyed", this._onScriptRealmDestroyed.bind(this))
+         ];
+       }
+-      static async connect(parent, transport, options) {
++      static async connect(parent, transport, options, progress2 = nullProgress) {
+         const browser = new _BidiBrowser(parent, transport, options);
++        try {
++          await browser._initialize(options, progress2);
++          return browser;
++        } catch (error) {
++          if (options.isBiDiAttach)
++            await browser.disconnect().catch(() => {});
++          throw error;
++        }
++      }
++      async _initialize(options, progress2) {
++        const browser = this;
+         if (options.__testHookOnConnectToBrowser)
+-          await options.__testHookOnConnectToBrowser();
+-        browser._bidiSessionInfo = await browser._browserSession.send("session.new", {
++          await progress2.race(options.__testHookOnConnectToBrowser());
++        browser._sessionReady = browser._browserSession.send("session.new", {
+           capabilities: {
+             alwaysMatch: {
+               "acceptInsecureCerts": options.persistent?.internalIgnoreHTTPSErrors || options.persistent?.ignoreHTTPSErrors,
+@@ -44665,8 +44710,12 @@ var init_bidiBrowser = __esm({
+               "goog:prerenderingDisabled": true
+             }
+           }
+-        });
+-        await browser._browserSession.send("session.subscribe", {
++        }).then((info) => browser._bidiSessionInfo = info);
++        await progress2.race(browser._sessionReady);
++        // Existing tabs are announced during subscription and need a context immediately.
++        if (options.persistent)
++          browser._defaultContext = new BidiBrowserContext2(browser, void 0, options.persistent);
++        await progress2.race(browser._browserSession.send("session.subscribe", {
+           events: [
+             "browsingContext",
+             "network",
+@@ -44674,21 +44723,49 @@ var init_bidiBrowser = __esm({
+             "script",
+             "input"
+           ]
+-        });
+-        await browser._browserSession.send("network.addIntercept", { phases: [Network.InterceptPhase.AuthRequired] });
+-        await browser._browserSession.send("network.addDataCollector", {
++        }));
++        await progress2.race(browser._browserSession.send("network.addIntercept", { phases: [Network.InterceptPhase.AuthRequired] }));
++        await progress2.race(browser._browserSession.send("network.addDataCollector", {
+           dataTypes: [Network.DataType.Response],
+           maxEncodedDataSize: 2e7
+           // same default as in CDP: https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/inspector/inspector_network_agent.cc;l=134;drc=4128411589187a396829a827f59a655bed876aa7
+-        });
++        }));
+         if (options.persistent) {
+-          const context = new BidiBrowserContext2(browser, void 0, options.persistent);
+-          browser._defaultContext = context;
+-          await context.initialize();
+-          const page = await browser._defaultContext.doCreateNewPage();
+-          await page.waitForInitializedOrError();
++          await progress2.race(browser._defaultContext.initialize());
++          if (options.isBiDiAttach) {
++            for (const [id, bidiPage] of browser._bidiPages) {
++              await progress2.race(bidiPage._page.waitForInitializedOrError());
++              // Loaded tabs will not emit their past lifecycle events again.
++              bidiPage._page.frameManager.frameLifecycleEvent(id, "domcontentloaded");
++              bidiPage._page.frameManager.frameLifecycleEvent(id, "load");
++            }
++          }
++          if (!options.isBiDiAttach || !browser._bidiPages.size) {
++            const page = await progress2.race(browser._defaultContext.doCreateNewPage());
++            await progress2.race(page.waitForInitializedOrError());
++          }
++        }
++      }
++      async disconnect() {
++        if (!this._disconnectPromise)
++          this._disconnectPromise = this._endSession();
++        return this._disconnectPromise;
++      }
++      async _endSession() {
++        let timer;
++        try {
++          await Promise.race([
++            (async () => {
++              await this._sessionReady;
++              if (this._bidiSessionInfo)
++                await this._browserSession.send("session.end", {});
++            })(),
++            new Promise((_, reject) => timer = setTimeout(() => reject(new Error("BiDi session.end timed out")), 5e3))
++          ]);
++        } finally {
++          clearTimeout(timer);
++          await this._connection._transport.closeAndWait();
+         }
+-        return browser;
+       }
+       _onDisconnect() {
+         this.didClose();
+@@ -44770,6 +44847,7 @@ var init_bidiBrowser = __esm({
+           return;
+         bidiPage.didClose();
+         this._bidiPages.delete(event.context);
++        this._connection._ownedBrowsingContexts.delete(event.context);
+       }
+       _onScriptRealmDestroyed(event) {
+         for (const page of this._bidiPages.values()) {
+@@ -44800,10 +44878,11 @@ var init_bidiBrowser = __esm({
+         ];
+         promises2.push(this.extendInjectedScript(source7));
+         const downloadBehavior = this._options.acceptDownloads === "accept" ? { type: "allowed", destinationFolder: this._browser.options.downloadsPath } : { type: "denied" };
+-        promises2.push(this._browser._browserSession.send("browser.setDownloadBehavior", {
+-          downloadBehavior,
+-          userContexts: [this._userContextId()]
+-        }));
++        if (!this._browser.options.isBiDiAttach)
++          promises2.push(this._browser._browserSession.send("browser.setDownloadBehavior", {
++            downloadBehavior,
++            userContexts: [this._userContextId()]
++          }));
+         promises2.push(this.doUpdateDefaultViewport());
+         if (this._options.geolocation)
+           promises2.push(this.setGeolocation(this._options.geolocation));
+@@ -44838,9 +44917,10 @@ var init_bidiBrowser = __esm({
+       }
+       async doCreateNewPage() {
+         const { context } = await this._browser._browserSession.send("browsingContext.create", {
+-          type: BrowsingContext.CreateType.Window,
++          type: BrowsingContext.CreateType.Tab,
+           userContext: this._browserContextId
+         });
++        this._browser._connection._ownedBrowsingContexts.add(context);
+         const page = this._browser._bidiPages.get(context)._page;
+         page.frameManager.frameLifecycleEvent(context, "domcontentloaded");
+         page.frameManager.frameLifecycleEvent(context, "load");
+@@ -45069,7 +45149,7 @@ var init_bidiBrowser = __esm({
+       async clearCache() {
+       }
+       async doClose(reason) {
+-        if (!this._browserContextId) {
++        if (this._browser.options.isBiDiAttach || !this._browserContextId) {
+           return "close-browser";
+         }
+         await this._browser._browserSession.send("browser.removeUserContext", {
+@@ -46096,7 +46176,7 @@ var init_firefoxPrefs = __esm({
+ });
+ 
+ // packages/playwright-core/src/server/bidi/bidiFirefox.ts
+-var import_os13, import_path28, BidiFirefox;
++var import_os13, import_path28, import_fsBidi, BidiFirefox;
+ var init_bidiFirefox = __esm({
+   "packages/playwright-core/src/server/bidi/bidiFirefox.ts"() {
+     "use strict";
+@@ -46108,6 +46188,8 @@ var init_bidiFirefox = __esm({
+     init_bidiBrowser();
+     init_bidiConnection();
+     init_firefoxPrefs();
++    init_transport();
++    import_fsBidi = __toESM(require("fs"));
+     BidiFirefox = class extends BrowserType {
+       constructor(parent) {
+         super(parent, "firefox");
+@@ -46115,6 +46197,41 @@ var init_bidiFirefox = __esm({
+       executablePath() {
+         return "";
+       }
++      async connectOverBiDi(progress2, params2) {
++        const endpoint = new URL(params2.wsEndpoint);
++        if (endpoint.protocol !== "ws:" && endpoint.protocol !== "wss:")
++          throw new Error("connectOverBiDi requires a ws:// or wss:// endpoint");
++        const artifactsDir = await import_fsBidi.default.promises.mkdtemp(import_path28.default.join(import_os13.default.tmpdir(), "browse-bidi-"));
++        const cleanup = () => import_fsBidi.default.promises.rm(artifactsDir, { recursive: true, force: true });
++        let browser;
++        let transport;
++        const disconnect = () => browser.disconnect();
++        try {
++          transport = await WebSocketTransport.connect(progress2, params2.wsEndpoint);
++          browser = await BidiBrowser.connect(this.attribution.playwright, transport, {
++            name: "firefox",
++            browserType: "firefox",
++            isBiDiAttach: true,
++            persistent: { noDefaultViewport: true, acceptDownloads: "internal-browser-default" },
++            browserProcess: { close: disconnect, kill: disconnect },
++            protocolLogger: helper.debugProtocolLogger(),
++            browserLogsCollector: new RecentLogsCollector(),
++            artifactsDir,
++            downloadsPath: artifactsDir,
++            tracesDir: artifactsDir,
++            originalLaunchOptions: {}
++          }, progress2);
++          browser.on(Browser.Events.Disconnected, () => cleanup().catch(() => {}));
++          await browser._defaultContext.loadDefaultContextAsIs(progress2);
++          return browser;
++        } catch (error) {
++          if (browser)
++            await browser.disconnect().catch(() => {});
++          await transport?.closeAndWait();
++          await cleanup();
++          throw error;
++        }
++      }
+       async connectToTransport(transport, options) {
+         return BidiBrowser.connect(this.attribution.playwright, transport, options);
+       }
+@@ -48178,6 +48295,9 @@ var init_firefox = __esm({
+         super(parent, "firefox");
+         this._bidiFirefox = bidiFirefox;
+       }
++      connectOverBiDi(progress2, params2) {
++        return this._bidiFirefox.connectOverBiDi(progress2, params2);
++      }
+       launch(progress2, options, protocolLogger) {
+         if (options.channel?.startsWith("moz-"))
+           return this._bidiFirefox.launch(progress2, options, protocolLogger);
+@@ -57964,6 +58084,16 @@ var init_browserTypeDispatcher = __esm({
+         const worker = await this._object.connectToWorker(progress2, params2.endpoint);
+         return { worker: new WorkerDispatcher(this, worker) };
+       }
++      async connectOverBiDi(params2, progress2) {
++        if (this._denyLaunch)
++          throw new Error(`Launching more browsers is not allowed.`);
++        const browser = await this._object.connectOverBiDi(progress2, params2);
++        const browserDispatcher = new BrowserDispatcher(this, browser);
++        return {
++          browser: browserDispatcher,
++          defaultContext: BrowserContextDispatcher.from(browserDispatcher, browser._defaultContext)
++        };
++      }
+     };
+   }
+ });
+@@ -66020,6 +66150,12 @@ var init_browserType2 = __esm({
+         }, new TimeoutSettings().timeout(params2));
+         return await this._browserFromConnectResult(result2);
+       }
++      async connectOverBiDi(wsEndpoint, options = {}) {
++        if (this.name() !== "firefox")
++          throw new Error("BiDi connections are only supported by Firefox");
++        const result2 = await this._channel.connectOverBiDi({ wsEndpoint }, new TimeoutSettings().timeout(options));
++        return await this._browserFromConnectResult(result2);
++      }
+       async _browserFromConnectResult(result2) {
+         const browser = Browser2.from(result2.browser);
+         browser._connectToBrowserType(this, {}, void 0);
+diff --git a/types/types.d.ts b/types/types.d.ts
+index 3510172679eb134d3371c5769c0e930d4780e49e..f39e64f9b7a22c1eb0d0d64f2e1bff739550fd7b 100644
+--- a/types/types.d.ts
++++ b/types/types.d.ts
+@@ -17314,6 +17314,12 @@ export interface Locator {
+  *
+  */
+ export interface BrowserType<Unused = {}> {
++  /**
++   * Attaches to a Firefox/Zen WebDriver BiDi WebSocket without owning its process.
++   * Closing the browser or a context ends the session and preserves all tabs; only tabs created by this connection can be closed individually.
++   */
++  connectOverBiDi(wsEndpoint: string, options?: { timeout?: number }): Promise<Browser>;
++
+   /**
+    * This method attaches Playwright to an existing browser instance using the Chrome DevTools Protocol.
+    *
