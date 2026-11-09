@@ -1,5 +1,6 @@
 import WebSocket from "ws"
 import { relayLog } from "./log.ts"
+import type { BidiStatus } from "./schema.ts"
 
 type Command = { id: number; method: string; params: Record<string, unknown> }
 type Message = {
@@ -17,6 +18,7 @@ export function createBidiGuard(options: {
   readonly isAdoptedContext?: (sessionId: string, context: string) => boolean
   readonly log?: typeof relayLog
   readonly cleanupTimeoutMs?: number
+  readonly statusTimeoutMs?: number
 }) {
   const endpoint = new URL(options.endpoint)
   if (endpoint.protocol !== "ws:" && endpoint.protocol !== "wss:") throw new Error("BiDi requires a ws:// or wss:// endpoint")
@@ -26,6 +28,10 @@ export function createBidiGuard(options: {
 
   return {
     get busy(): boolean { return active !== undefined },
+    async status(): Promise<BidiStatus> {
+      const result = await probeStatus(endpoint, options.statusTimeoutMs ?? 2_000)
+      return { ...result, sessionSlot: result.reachable && active ? "browse" : result.sessionSlot }
+    },
     // The caller authenticates the socket and supplies its session identity; wire messages cannot grant ownership.
     accept(client: WebSocket, sessionId?: string): void {
       if (stopped || active) {
@@ -195,4 +201,38 @@ export function createBidiGuard(options: {
       await active?.close()
     },
   }
+}
+
+// session.status needs no session; diagnostics must never acquire or end someone else's slot.
+function probeStatus(endpoint: URL, timeoutMs: number): Promise<BidiStatus> {
+  return new Promise((resolve) => {
+    let socket: WebSocket
+    try {
+      socket = new WebSocket(endpoint, { handshakeTimeout: timeoutMs, maxPayload: 64 * 1024, followRedirects: false })
+    } catch {
+      resolve({ endpoint: endpoint.href, reachable: false, sessionSlot: "unknown", error: "Invalid BiDi WebSocket URL; check bidiEndpoint." })
+      return
+    }
+    let settled = false
+    const finish = (sessionSlot: BidiStatus["sessionSlot"], error: string | null = null) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.terminate()
+      resolve({ endpoint: endpoint.href, reachable: error === null, sessionSlot, error })
+    }
+    const timer = setTimeout(() => finish("unknown", "BiDi session.status timed out; check the browser's debugging flag and configured endpoint."), timeoutMs)
+    socket.on("open", () => socket.send(JSON.stringify({ id: 1, method: "session.status", params: {} })))
+    socket.on("error", () => finish("unknown", "BiDi endpoint is unavailable; start Firefox/Zen with --remote-debugging-port matching bidiEndpoint."))
+    socket.on("close", () => finish("unknown", "BiDi endpoint disconnected before answering session.status."))
+    socket.on("message", (data, binary) => {
+      try {
+        const message = JSON.parse(String(data)) as Message
+        if (binary || !message || message.id !== 1 || message.type !== "success" || typeof message.result?.ready !== "boolean") throw new Error()
+        finish(message.result.ready ? "free" : "occupied")
+      } catch {
+        finish("unknown", "BiDi endpoint did not return a valid session.status response.")
+      }
+    })
+  })
 }

@@ -752,6 +752,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     cleanupTabs,
     settings: settingsSync.httpSettings,
     extensionStatus: () => ({ ...handshake.extensionStatus(), ...(bidi ? { transport: "bidi" as const } : {}) }),
+    ...(bidiGuard ? { bidiStatus: () => bidiGuard.status() } : {}),
   })
 
   let relayReady = false

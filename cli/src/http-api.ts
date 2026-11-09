@@ -19,7 +19,7 @@ import {
   validateBrowserFetchSite,
   validateHostHeader,
 } from "./relay/helpers.ts"
-import { RelayShutdownRequest, type ExtensionStatus } from "./relay/schema.ts"
+import { RelayShutdownRequest, type BidiStatus, type ExtensionStatus } from "./relay/schema.ts"
 import { relayTokenQueryParam } from "./relay/secrets.ts"
 import type { RelayShutdown } from "./relay/shutdown.ts"
 import type { OpenCodeBrowserSessions } from "./session-manager.ts"
@@ -36,6 +36,7 @@ export function createHttpRequestHandler(options: {
   readonly authToken: string
   readonly relayInstance: { readonly id: string; readonly startedAt: string; readonly pid: number; readonly managed: boolean }
   readonly shutdown: RelayShutdown
+  readonly bidiStatus?: () => Promise<BidiStatus>
   readonly extensionStatus: () => Pick<ExtensionStatus,
     "connected" | "pairingState" | "nextStep" | "version" | "build" | "origin" | "protocolVersion" | "protocolCompatible" | "protocolLegacy" | "browsers" | "rejectedConnections" | "pairingFailures" | "cdpClients" | "processFaults" | "transport"
   >
@@ -168,13 +169,17 @@ export function createHttpRequestHandler(options: {
     }
     if (pathname === "/extension/status") {
       if (request.headers["x-browse-install"] === "waiting") installWaitingUntil = Date.now() + 5_000
-      sendJson(response, {
-        ...options.extensionStatus(),
-        activeTargets: options.registry.rootTargetCount(),
-        childTargets: options.registry.childTargets.size,
-        sessions: options.sessions.listSummaries(),
-        targets: targetSummaries(options.registry),
-      })
+      run(Effect.gen(function* () {
+        const bidi = options.bidiStatus ? yield* Effect.promise(options.bidiStatus) : undefined
+        sendJson(response, {
+          ...options.extensionStatus(),
+          ...(bidi ? { bidi } : {}),
+          activeTargets: options.registry.rootTargetCount(),
+          childTargets: options.registry.childTargets.size,
+          sessions: options.sessions.listSummaries(),
+          targets: targetSummaries(options.registry),
+        })
+      }))
       return
     }
     if (pathname.startsWith("/recording/")) {

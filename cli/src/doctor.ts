@@ -1,7 +1,7 @@
 import { Effect, FileSystem, Path, Schema } from "effect"
 import * as RelayClient from "./relay/client.ts"
 import { relayBuildProblem } from "./relay/lifecycle.ts"
-import type { ExtensionStatus, RelayVersion, SessionSummary, TargetSummary } from "./relay/schema.ts"
+import type { BidiStatus, ExtensionStatus, RelayVersion, SessionSummary, TargetSummary } from "./relay/schema.ts"
 import { extensionProtocolAdvice, extensionProtocolVersion } from "./protocol.ts"
 import { binaryPackage, cacheRoot, cliCommand, compiledBinary, configRoot, dataRoot, devExtension, fromCheckout, installCommand, stateRoot } from "./paths.ts"
 import * as SessionStore from "./session-manager/store.ts"
@@ -57,6 +57,7 @@ export type DoctorCheck = {
 export type DoctorReport = {
   readonly status: DoctorCheckStatus
   readonly endpoint: string
+  readonly bidi: BidiStatus | null
   readonly paths: {
     readonly config: string
     readonly data: string
@@ -240,6 +241,7 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
   const report: DoctorReport = {
     status: summarizeCheckStatus(checks),
     endpoint: relay.endpoint,
+    bidi: extensionResult.ok ? extensionResult.value.bidi ?? null : null,
     paths: {
       config: configRoot(),
       data: dataRoot(),
@@ -321,6 +323,7 @@ function buildDoctorChecks(options: {
   readonly sessionsResult: ProbeResult<readonly SessionSummary[]>
   readonly update: UpdateJson | null
 }): readonly DoctorCheck[] {
+  const bidi = options.extensionResult.ok && options.extensionResult.value.transport === "bidi"
   const packageBinChecks: readonly DoctorCheck[] = options.packageResult.ok
     ? [
       {
@@ -354,7 +357,7 @@ function buildDoctorChecks(options: {
       message: options.relayResult.ok ? `reachable (${options.relayResult.value.version})` : options.relayResult.error,
     },
     relayBuildCheck({ relayResult: options.relayResult, cliBuildId: opencodeBrowserBuildId }),
-    {
+    ...(bidi ? bidiDoctorChecks(options.extensionResult.ok ? options.extensionResult.value.bidi : undefined) : [{
       id: "extension-connected",
       label: "extension connection",
       status: options.extensionResult.ok && options.extensionResult.value.connected ? "ok" : "fail",
@@ -383,7 +386,7 @@ function buildDoctorChecks(options: {
       message: options.extensionResult.value.pairingFailures > 0
         ? `${options.extensionResult.value.pairingFailures} connection(s) failed pairing${options.extensionResult.value.connected ? "; a paired extension is connected" : `; update the extension, or run \`${cliCommand("pair")}\` and enter the code on its status page`}`
         : "no failed pairing attempts",
-    }] : []),
+    }] : [])] satisfies readonly DoctorCheck[]),
     ...(options.extensionResult.ok && options.extensionResult.value.processFaults !== undefined ? [{
       id: "relay-process-faults",
       label: "relay process faults",
@@ -448,6 +451,25 @@ const makeDoctorCheck = (id: string, label: string) => (status: DoctorCheckStatu
   status,
   message,
 })
+
+export function formatBidiStatus(status: BidiStatus): string {
+  const slot = { free: "free", browse: "occupied by browse", occupied: "occupied by another client", unknown: "unknown" }[status.sessionSlot]
+  return `BiDi: ${status.endpoint} (${status.reachable ? "reachable" : "unavailable"}); session slot: ${slot}${status.error ? `; ${status.error}` : ""}`
+}
+
+function bidiDoctorChecks(status: BidiStatus | undefined): readonly DoctorCheck[] {
+  return [
+    {
+      id: "bidi-endpoint", label: "BiDi endpoint", status: status?.reachable ? "ok" : "fail",
+      message: status ? `${status.endpoint}: ${status.error ?? "reachable"}` : "relay did not report BiDi diagnostics",
+    },
+    {
+      id: "bidi-session-slot", label: "BiDi session slot",
+      status: status?.sessionSlot === "free" || status?.sessionSlot === "browse" ? "ok" : "warn",
+      message: status ? formatBidiStatus(status) : "unknown",
+    },
+  ]
+}
 
 function unhealthyTargetsCheck(options: {
   readonly targetsResult: ProbeResult<readonly TargetSummary[]>
@@ -544,7 +566,8 @@ function buildDoctorRecommendations(options: {
   const relayBuildRecommendations = options.relayResult.ok
     ? [relayBuildProblem(options.relayResult.value)].filter((message) => message !== undefined)
     : []
-  const extensionRecommendations = options.relayResult.ok && options.extensionResult.ok && !options.extensionResult.value.connected
+  const bidi = options.extensionResult.ok ? options.extensionResult.value.bidi : undefined
+  const extensionRecommendations = options.relayResult.ok && options.extensionResult.ok && options.extensionResult.value.transport !== "bidi" && !options.extensionResult.value.connected
     ? options.extensionResult.value.nextStep ? [options.extensionResult.value.nextStep] : options.extensionResult.value.protocolCompatible === false
       ? [extensionProtocolAdvice(options.extensionResult.value.protocolVersion, { install: installCommand() })]
       : [fromCheckout() || devExtension()
@@ -567,6 +590,8 @@ function buildDoctorRecommendations(options: {
     ...(options.update ? [options.update.notice] : []),
     ...relayRecommendations,
     ...relayBuildRecommendations,
+    ...(bidi?.error ? [bidi.error] : []),
+    ...(bidi?.sessionSlot === "occupied" ? ["Stop the other automation client normally so it sends session.end. If the slot remains occupied, save your tabs and restart Firefox/Zen yourself."] : []),
     ...extensionRecommendations,
     ...connectionConflictRecommendations,
     ...artifactRecommendations,
@@ -598,7 +623,7 @@ export function formatDoctorReport(report: DoctorReport): string {
     `CLI: ${report.cli.version} (${report.cli.buildId})`,
     `Package: ${report.package.name && report.package.version ? `${report.package.name} ${report.package.version}` : report.package.error ?? "unknown"}`,
     `Relay: ${report.relay.reachable ? `reachable (${report.relay.version ?? "unknown"}, ${report.relay.buildId ?? "unknown build"})` : `unreachable (${report.relay.error ?? "unknown error"})`}`,
-    `Extension: ${formatExtensionSummary(report)}`,
+    report.bidi ? formatBidiStatus(report.bidi) : `Extension: ${formatExtensionSummary(report)}`,
     `Targets: active=${formatNullableNumber(report.targets.active)} child=${formatNullableNumber(report.targets.child)} relay-owned=${report.targets.relayOwned.length} unhealthy=${report.targets.unhealthy.length}`,
     `Sessions: current=${report.sessions.current ?? "none"} total=${report.sessions.all.length} connected=${report.sessions.all.filter((session) => {
       return session.connected

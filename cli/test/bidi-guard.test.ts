@@ -17,6 +17,8 @@ async function until(check: () => boolean) {
 
 async function fixture(options: {
   rejectSession?: boolean
+  stallStatus?: boolean
+  statusReply?: unknown
   sessionDelay?: number
   endDelay?: number
   failCreate?: boolean
@@ -47,6 +49,9 @@ async function fixture(options: {
       const reply = (result: unknown = {}) => socket.send(JSON.stringify({ type: "success", id: command.id, result }))
       const fail = (error: string, message: string) => socket.send(JSON.stringify({ type: "error", id: command.id, error, message }))
       switch (command.method) {
+        case "session.status":
+          if (options.stallStatus) return
+          return reply(options.statusReply ?? { ready: !sessionActive && !options.rejectSession, message: "" })
         case "session.new": {
           if (sessionActive || options.rejectSession) return fail("session not created", "Maximum number of active sessions")
           const acquire = () => {
@@ -84,6 +89,7 @@ async function fixture(options: {
   const guard = createBidiGuard({
     endpoint,
     cleanupTimeoutMs: 200,
+    statusTimeoutMs: 100,
     log: (event, fields = {}) => { logs.push({ event, fields }) },
     ...(options.isAdoptedContext ? { isAdoptedContext: options.isAdoptedContext } : {}),
   })
@@ -144,6 +150,58 @@ test("forwards commands and events, drops browser.close independently of the cli
   expect(f.logs.at(-1)?.fields).toEqual({ method: "session.end" })
   expect(f.sessionActive).toBe(false)
   expect(f.leaked).toBe(false)
+})
+
+test("status reports a free slot without acquiring a session or touching tabs", async () => {
+  const f = await fixture()
+  for (let i = 0; i < 2; i++) {
+    expect(await f.guard.status()).toMatchObject({ reachable: true, sessionSlot: "free", error: null })
+  }
+  expect(f.commands.map(({ method }) => method)).toEqual(["session.status", "session.status"])
+  expect(f.guard.busy).toBe(false)
+  expect(f.sessionActive).toBe(false)
+  expect([...f.tabs]).toEqual(["user-tab"])
+})
+
+test("status distinguishes an occupied external slot without ending it", async () => {
+  const f = await fixture({ rejectSession: true })
+  expect(await f.guard.status()).toMatchObject({ reachable: true, sessionSlot: "occupied", error: null })
+  expect(f.commands.map(({ method }) => method)).toEqual(["session.status"])
+})
+
+test("status recognizes browse's slot without disturbing its client", async () => {
+  const f = await fixture()
+  const client = await f.connect()
+  await client.send("session.new")
+  expect(await f.guard.status()).toMatchObject({ reachable: true, sessionSlot: "browse", error: null })
+  expect(f.commands.map(({ method }) => method)).toEqual(["session.new", "session.status"])
+  expect(f.sessionActive).toBe(true)
+  await f.guard.close()
+  expect(await f.guard.status()).toMatchObject({ sessionSlot: "free" })
+})
+
+test("status bounds silent endpoints and rejects malformed replies without leaking their data", async () => {
+  const silent = await fixture({ stallStatus: true })
+  expect(await silent.guard.status()).toMatchObject({ reachable: false, sessionSlot: "unknown", error: expect.stringContaining("timed out") })
+  for (const statusReply of [{ ready: "true", message: "private-data" }, {}, []]) {
+    const invalid = await fixture({ statusReply })
+    const report = await invalid.guard.status()
+    expect(report).toMatchObject({ reachable: false, sessionSlot: "unknown", error: expect.stringContaining("valid session.status") })
+    expect(JSON.stringify(report)).not.toContain("private-data")
+    expect(invalid.commands.map(({ method }) => method)).toEqual(["session.status"])
+  }
+})
+
+test("status reports an unavailable endpoint with launch advice", async () => {
+  const f = await fixture()
+  await new Promise<void>((resolve) => f.remote.close(() => resolve()))
+  expect(await f.guard.status()).toMatchObject({ reachable: false, sessionSlot: "unknown", error: expect.stringContaining("--remote-debugging-port") })
+})
+
+test("status reports unsupported WebSocket URLs instead of rejecting the report", async () => {
+  const guard = createBidiGuard({ endpoint: "ws://unused.invalid/session#fragment", log: () => {} })
+  expect(await guard.status()).toMatchObject({ reachable: false, sessionSlot: "unknown", error: expect.stringContaining("Invalid BiDi") })
+  await guard.close()
 })
 
 test("only successful creation grants close permission; existing tabs and user contexts stay protected", async () => {

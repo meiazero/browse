@@ -294,8 +294,18 @@ export const ConnectedBrowser = Schema.Struct({
 
 export interface ConnectedBrowser extends Schema.Schema.Type<typeof ConnectedBrowser> {}
 
+export const BidiStatus = Schema.Struct({
+  endpoint: Schema.String,
+  reachable: Schema.Boolean,
+  sessionSlot: Schema.Literals(["free", "browse", "occupied", "unknown"]),
+  error: Schema.NullOr(Schema.String),
+})
+
+export interface BidiStatus extends Schema.Schema.Type<typeof BidiStatus> {}
+
 export const ExtensionStatus = Schema.Struct({
   transport: Schema.optionalKey(Schema.Literals(["cdp", "bidi"])),
+  bidi: Schema.optionalKey(BidiStatus),
   connected: Schema.Boolean,
   pairingState: Schema.optionalKey(Schema.Literals(["connected", "incompatible", "refused", "unpaired", "paired-offline", "not-seen"])),
   nextStep: Schema.optionalKey(Schema.String),

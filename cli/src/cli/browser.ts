@@ -2,7 +2,7 @@ import { Console, Effect, Option, Result } from "effect"
 import { Argument, Command, Flag } from "effect/cli"
 import { autoUpdateStatus } from "../update/auto-update.ts"
 import { ExitCode } from "./output.ts"
-import { createDoctorReport, formatDoctorReport, formatTargetSummary } from "../doctor.ts"
+import { createDoctorReport, formatBidiStatus, formatDoctorReport, formatTargetSummary } from "../doctor.ts"
 import { cliCommand, installCommand } from "../paths.ts"
 import { extensionProtocolAdvice } from "../protocol.ts"
 import * as RelayClient from "../relay/client.ts"
@@ -157,6 +157,7 @@ const status = Command.make(
           stale: buildProblem !== undefined,
         },
         extension: extensionStatus,
+        bidi: extensionStatus.bidi ?? null,
         currentSession: current ?? null,
         sessions,
         targets,
@@ -174,32 +175,36 @@ const status = Command.make(
     if (buildProblem) {
       yield* Console.log(`Warning: ${buildProblem}`)
     }
-    yield* Console.log(
-      `Extension: ${extensionStatus.connected ? "connected" : "disconnected"}${extensionStatus.version ? ` (${extensionStatus.version})` : ""}`,
-    )
-    if ((extensionStatus.rejectedConnections ?? 0) > 0) {
+    if (extensionStatus.bidi) {
+      yield* Console.log(formatBidiStatus(extensionStatus.bidi))
+    } else {
       yield* Console.log(
-        `Warning: ${extensionStatus.rejectedConnections} competing browser/profile connection attempt(s) rejected; the active connection was preserved. The relay is an older browse that connects one browser at a time; update browse on the computer running the relay, or close the other browser.`,
+        `Extension: ${extensionStatus.connected ? "connected" : "disconnected"}${extensionStatus.version ? ` (${extensionStatus.version})` : ""}`,
       )
-    }
-    if (extensionStatus.nextStep) yield* Console.log(extensionStatus.nextStep)
-    else if ((extensionStatus.pairingFailures ?? 0) > 0 && !extensionStatus.connected) {
-      yield* Console.log(
-        `Warning: ${extensionStatus.pairingFailures} extension connection(s) failed pairing. Update the extension, or run \`${cliCommand("pair")}\` and enter the code on its status page.`,
-      )
+      if ((extensionStatus.rejectedConnections ?? 0) > 0) {
+        yield* Console.log(
+          `Warning: ${extensionStatus.rejectedConnections} competing browser/profile connection attempt(s) rejected; the active connection was preserved. The relay is an older browse that connects one browser at a time; update browse on the computer running the relay, or close the other browser.`,
+        )
+      }
+      if (extensionStatus.nextStep) yield* Console.log(extensionStatus.nextStep)
+      else if ((extensionStatus.pairingFailures ?? 0) > 0 && !extensionStatus.connected) {
+        yield* Console.log(
+          `Warning: ${extensionStatus.pairingFailures} extension connection(s) failed pairing. Update the extension, or run \`${cliCommand("pair")}\` and enter the code on its status page.`,
+        )
+      }
+      if (extensionStatus.protocolVersion !== undefined && extensionStatus.protocolVersion !== null) {
+        const compatibility = extensionStatus.protocolCompatible === false ? "incompatible" : "compatible"
+        const legacy = extensionStatus.protocolLegacy === true ? ", inferred from legacy hello" : ""
+        yield* Console.log(`Extension protocol: ${extensionStatus.protocolVersion} (${compatibility}${legacy})`)
+        if (extensionStatus.protocolCompatible === false && !extensionStatus.nextStep)
+          yield* Console.log(extensionProtocolAdvice(extensionStatus.protocolVersion, { install: installCommand() }))
+      }
     }
     if ((extensionStatus.processFaults?.suppressed ?? 0) > 0) {
       const faults = extensionStatus.processFaults!
       yield* Console.log(
         `Warning: the relay survived ${faults.suppressed} process fault(s)${faults.lastAt ? `, last at ${faults.lastAt}` : ""}${faults.lastMessage ? `: ${faults.lastMessage}` : ""}. See the relay log.`,
       )
-    }
-    if (extensionStatus.protocolVersion !== undefined && extensionStatus.protocolVersion !== null) {
-      const compatibility = extensionStatus.protocolCompatible === false ? "incompatible" : "compatible"
-      const legacy = extensionStatus.protocolLegacy === true ? ", inferred from legacy hello" : ""
-      yield* Console.log(`Extension protocol: ${extensionStatus.protocolVersion} (${compatibility}${legacy})`)
-      if (extensionStatus.protocolCompatible === false && !extensionStatus.nextStep)
-        yield* Console.log(extensionProtocolAdvice(extensionStatus.protocolVersion, { install: installCommand() }))
     }
     yield* Console.log(`Active targets: ${extensionStatus.activeTargets}`)
     if (extensionStatus.childTargets !== undefined) {
@@ -247,7 +252,7 @@ const status = Command.make(
       yield* failExit
     }
   }),
-).pipe(Command.withDescription("Show relay, extension, and target status"))
+).pipe(Command.withDescription("Show relay, browser transport, and target status"))
 
 const mcp = Command.make(
   "mcp",

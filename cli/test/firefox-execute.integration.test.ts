@@ -7,6 +7,7 @@ import path from "node:path"
 import { firefox as firefoxApi } from "patchright-core"
 import { WebSocketServer } from "ws"
 import { createBidiGuard } from "../src/relay/bidi-guard.ts"
+import type { BidiStatus } from "../src/relay/schema.ts"
 import { connectCdp, startRelay, stopRelay } from "./relay-harness.ts"
 import { mcpStdio } from "./support/mcp-stdio.ts"
 
@@ -81,6 +82,12 @@ test.skipIf(process.env.BROWSE_TEST_FIREFOX_BIDI !== "1")("MCP execute creates, 
     writeFileSync(path.join(root, "config.json"), JSON.stringify({ browser: "firefox", bidiEndpoint: endpoint }))
     relay = await startRelay(root)
     const headers = { authorization: `Bearer ${relay.token}`, "content-type": "application/json" }
+    const bidiStatus = async () => {
+      const response = await fetch(`http://127.0.0.1:${relay!.port}/extension/status`, { headers })
+      expect(response.ok).toBe(true)
+      return (await response.json() as { bidi: BidiStatus }).bidi
+    }
+    expect(await bidiStatus()).toEqual({ endpoint, reachable: true, sessionSlot: "free", error: null })
     const post = async (route: string, body: unknown) => {
       const response = await fetch(`http://127.0.0.1:${relay!.port}${route}`, { method: "POST", headers, body: JSON.stringify(body) })
       const result = await response.json() as Record<string, unknown>
@@ -99,6 +106,7 @@ test.skipIf(process.env.BROWSE_TEST_FIREFOX_BIDI !== "1")("MCP execute creates, 
       return reply.result?.structuredContent as Record<string, unknown>
     }
     await tool("session_new", { id: "firefox-smoke" })
+    expect(await bidiStatus()).toMatchObject({ reachable: true, sessionSlot: "browse", error: null })
     const created = await fetch(`http://127.0.0.1:${relay.port}/json/list`, { headers }).then((response) => response.json()) as unknown[]
     expect(created).toHaveLength(2)
     for (const [body, message] of [
@@ -132,6 +140,7 @@ test.skipIf(process.env.BROWSE_TEST_FIREFOX_BIDI !== "1")("MCP execute creates, 
     expect(catalog).toContain("firefox-smoke")
     expect(catalog).not.toContain('"target"')
     await tool("session_delete", { session: "firefox-smoke" })
+    expect(await bidiStatus()).toMatchObject({ reachable: true, sessionSlot: "free", error: null })
     expect(firefox.exitCode).toBeNull()
     await tool("session_new", { id: "firefox-reconnect" })
     const preserved = await tool("execute", { session: "firefox-reconnect", code: "return context.pages().map(tab => tab.url())" })
