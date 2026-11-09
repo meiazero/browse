@@ -5,7 +5,8 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { firefox, type Browser } from "patchright-core"
-import WebSocket from "ws"
+import WebSocket, { WebSocketServer } from "ws"
+import { createBidiGuard } from "../src/relay/bidi-guard.ts"
 
 async function freeFirefoxPort() {
   for (let port = 19300; port <= 19399; port++) {
@@ -86,6 +87,8 @@ test.skipIf(process.env.BROWSE_TEST_FIREFOX_BIDI !== "1")("attaches to an isolat
     fetch: (request) => new Response(`<title>${new URL(request.url).pathname === "/preserved" ? "Preserved" : "Owned"} test tab</title>`, { headers: { "content-type": "text/html" } }),
   })
   let browser: Browser | undefined
+  let guard: ReturnType<typeof createBidiGuard> | undefined
+  let proxy: WebSocketServer | undefined
   try {
     const endpoint = await new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Isolated Firefox did not announce its BiDi endpoint")), 15_000)
@@ -110,7 +113,15 @@ test.skipIf(process.env.BROWSE_TEST_FIREFOX_BIDI !== "1")("attaches to an isolat
       child.once("exit", () => { clearTimeout(timer); reject(new Error(`Isolated Firefox exited: ${output}`)) })
     })
     const url = await seedTab(endpoint, new URL("/preserved", content.url).href)
-    browser = await firefox.connectOverBiDi(endpoint, { timeout: 10_000 })
+    const methods: string[] = []
+    guard = createBidiGuard({ endpoint, log: (event, fields) => {
+      if (event === "bidi.command") methods.push(String(fields?.method))
+    } })
+    proxy = new WebSocketServer({ host: "127.0.0.1", port: 0 })
+    proxy.on("connection", (socket) => guard!.accept(socket))
+    await new Promise<void>((resolve) => proxy!.once("listening", resolve))
+    const guardedEndpoint = `ws://127.0.0.1:${(proxy.address() as net.AddressInfo).port}/session`
+    browser = await firefox.connectOverBiDi(guardedEndpoint, { timeout: 10_000 })
     const context = browser.contexts()[0]!
     const original = context.pages().find((page) => page.url() === url)!
     expect(original).toBeDefined()
@@ -124,15 +135,23 @@ test.skipIf(process.env.BROWSE_TEST_FIREFOX_BIDI !== "1")("attaches to an isolat
     await expect(original.close()).rejects.toThrow("did not create")
     await browser.close()
     expect(child.exitCode).toBeNull()
-    browser = await firefox.connectOverBiDi(endpoint, { timeout: 10_000 })
+    browser = await firefox.connectOverBiDi(guardedEndpoint, { timeout: 10_000 })
     expect(browser.contexts()[0]!.pages().map((tab) => tab.url())).toEqual(originalURLs)
     expect(await browser.contexts()[0]!.pages().find((tab) => tab.url() === url)!.title()).toBe("Preserved test tab")
     await browser.contexts()[0]!.close()
-    browser = await firefox.connectOverBiDi(endpoint, { timeout: 10_000 })
+    browser = await firefox.connectOverBiDi(guardedEndpoint, { timeout: 10_000 })
     await browser.close()
+    await guard.close()
+    expect(methods.filter((method) => method === "session.end")).toHaveLength(3)
+    expect(methods).not.toContain("browser.close")
     expect(child.exitCode).toBeNull()
   } finally {
     await browser?.close().catch(() => {})
+    await guard?.close().catch(() => {})
+    if (proxy) {
+      for (const socket of proxy.clients) socket.terminate()
+      await new Promise<void>((resolve) => proxy!.close(() => resolve()))
+    }
     child.kill("SIGTERM")
     const timer = setTimeout(() => child.kill("SIGKILL"), 2_000)
     await exited
