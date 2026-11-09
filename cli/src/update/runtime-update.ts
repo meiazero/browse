@@ -167,8 +167,7 @@ export async function runInstalledUpdate(args: readonly string[], runtime = inst
 }
 
 /** `self-update <version> [--channel <tag>]`: the relay's installer child. Exit 0 when the installer succeeded. */
-export async function runSelfUpdate(args: readonly string[]) {
-  const runtime = installedRuntime()
+export async function runSelfUpdate(args: readonly string[], runtime = installedRuntime()) {
   const version = args[0]
   const channelAt = args.indexOf("--channel")
   const channel = (channelAt === -1 ? channelOf(version ?? "") : args[channelAt + 1]) as Channel | undefined
@@ -193,7 +192,11 @@ export async function runSelfUpdate(args: readonly string[]) {
     log(`${new Date().toISOString()} installed ${installed}`)
     updateState(({ installing, lastError: _lastError, ...state }) => {
       const still = installing?.pid === process.pid ? undefined : installing
-      return { ...state, ...(still ? { installing: still } : {}) }
+      return {
+        ...state,
+        ...(still ? { installing: still } : {}),
+        ...(installed !== runtime.version ? { lastUpdate: { from: runtime.version, to: installed, at: new Date().toISOString() } } : {}),
+      }
     })
   } catch (error) {
     updateState(({ installing, ...state }) => {
